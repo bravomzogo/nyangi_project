@@ -171,6 +171,14 @@
             box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
             margin-bottom: 8px;
             gap: 8px;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+        
+        .typing-indicator.visible {
+            opacity: 1;
+            transform: translateY(0);
         }
         
         .typing-indicator span.dot {
@@ -342,13 +350,18 @@
             constructor() {
                 this.socket = null;
                 this.reconnectAttempts = 0;
-                this.maxReconnectAttempts = 10;  // Increased max attempts
-                this.baseReconnectDelay = 1000;  // Start with 1s delay
-                this.maxReconnectDelay = 30000;  // Max 30s delay
+                this.maxReconnectAttempts = 10;
+                this.baseReconnectDelay = 1000;
+                this.maxReconnectDelay = 30000;
                 this.typingTimeout = null;
                 this.currentTypingUsers = new Set();
                 this.heartbeatInterval = null;
-                this.messageQueue = [];  // Queue for messages when offline
+                this.messageQueue = [];
+                this.isTyping = false;
+                this.lastTypingTime = 0;
+                this.typingDebounceTimer = null;
+                this.TYPING_INTERVAL = 3000; // 3 seconds of inactivity stops typing
+                this.TYPING_DEBOUNCE = 500; // Only send typing after 500ms of continuous typing
                 this.init();
             }
 
@@ -359,12 +372,10 @@
             }
 
             connect() {
-                // Close existing connection if any
                 if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
                     this.socket.close();
                 }
 
-                // Determine WebSocket protocol based on current page
                 const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
                 const wsUrl = protocol + window.location.host + "/ws/chat/";
                 
@@ -382,21 +393,18 @@
                 this.reconnectAttempts = 0;
                 this.updateConnectionStatus('online', 'Connected');
 
-                // Start heartbeat
                 this.heartbeatInterval = setInterval(() => {
                     if (this.socket.readyState === WebSocket.OPEN) {
                         this.send({ type: 'ping' });
                     }
-                }, 20000);  // 20 seconds
+                }, 20000);
 
-                // Notify server of connection
                 this.send({ 
                     type: 'presence', 
                     user: "{{request.user.username}}",
                     status: 'online'
                 });
 
-                // Send any queued messages
                 this.flushMessageQueue();
             }
 
@@ -404,7 +412,6 @@
                 console.log(`WebSocket closed: ${event.code}`, event);
                 clearInterval(this.heartbeatInterval);
                 
-                // Abnormal closure (1006) or network error
                 if (event.code === 1006 || event.code === 1001 || event.code === 1002) {
                     const delay = this.calculateReconnectDelay();
                     
@@ -424,12 +431,11 @@
             }
 
             calculateReconnectDelay() {
-                // Exponential backoff with jitter
                 const baseDelay = Math.min(
                     this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
                     this.maxReconnectDelay
                 );
-                return baseDelay * (0.5 + Math.random());  // Add jitter
+                return baseDelay * (0.5 + Math.random());
             }
 
             handleError(error) {
@@ -455,7 +461,6 @@
                             this.handlePresenceUpdate(data);
                             break;
                         case 'pong':
-                            // Heartbeat response - connection is healthy
                             break;
                         case 'error':
                             console.error("Server error:", data.message);
@@ -472,7 +477,6 @@
                 const timeString = this.formatTimestamp(data.timestamp);
                 const isCurrentUser = data.username === "{{request.user.username}}";
                 
-                // Play receive sound for others' messages
                 if (!isCurrentUser && audioEnabled) {
                     receiveSound.currentTime = 0;
                     receiveSound.play().catch(e => console.log("Receive sound error:", e));
@@ -500,43 +504,59 @@
             handleTyping(username, isTyping) {
                 if (username === "{{request.user.username}}") return;
                 
+                const wasTyping = this.currentTypingUsers.size > 0;
+                
                 if (isTyping) {
                     this.currentTypingUsers.add(username);
                 } else {
                     this.currentTypingUsers.delete(username);
                 }
-                this.updateTypingIndicator();
-            }
-
-            handlePresenceUpdate(data) {
-                // Optional: Show user join/leave notifications
-                if (data.status === 'online') {
-                    console.log(`${data.user} joined the chat`);
-                } else if (data.status === 'offline') {
-                    console.log(`${data.user} left the chat`);
+                
+                const isTypingNow = this.currentTypingUsers.size > 0;
+                
+                if (wasTyping !== isTypingNow) {
+                    this.updateTypingIndicator();
                 }
             }
 
             updateTypingIndicator() {
-                const existingIndicator = document.getElementById('typing-indicator');
-                if (existingIndicator) existingIndicator.remove();
+                const indicator = document.getElementById('typing-indicator') || 
+                    this.createTypingIndicator();
                 
                 if (this.currentTypingUsers.size > 0) {
-                    const indicator = document.createElement('div');
-                    indicator.id = 'typing-indicator';
-                    indicator.className = 'typing-indicator';
-                    
                     const usersText = Array.from(this.currentTypingUsers).join(', ') + 
                         (this.currentTypingUsers.size > 1 ? ' are typing' : ' is typing');
-                    indicator.innerHTML = `
-                        <span class="username">${usersText}</span>
-                        <span class="dot"></span>
-                        <span class="dot"></span>
-                        <span class="dot"></span>
-                    `;
                     
-                    document.getElementById("id_chat_item_container").appendChild(indicator);
-                    this.scrollToBottom();
+                    indicator.querySelector('.username').textContent = usersText;
+                    indicator.classList.add('visible');
+                } else {
+                    indicator.classList.remove('visible');
+                }
+                
+                this.scrollToBottom();
+            }
+
+            createTypingIndicator() {
+                const indicator = document.createElement('div');
+                indicator.id = 'typing-indicator';
+                indicator.className = 'typing-indicator';
+                
+                indicator.innerHTML = `
+                    <span class="username"></span>
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                `;
+                
+                document.getElementById("id_chat_item_container").appendChild(indicator);
+                return indicator;
+            }
+
+            handlePresenceUpdate(data) {
+                if (data.status === 'online') {
+                    console.log(`${data.user} joined the chat`);
+                } else if (data.status === 'offline') {
+                    console.log(`${data.user} left the chat`);
                 }
             }
 
@@ -595,6 +615,16 @@
                     
                     input.value = "";
                     input.focus();
+                    
+                    // Send stop typing notification
+                    this.sendStopTyping();
+                }
+            }
+
+            sendStopTyping() {
+                if (this.isTyping) {
+                    this.send({ type: 'stop_typing', username: "{{request.user.username}}" });
+                    this.isTyping = false;
                 }
             }
 
@@ -670,21 +700,34 @@
                     this.sendMessage();
                 });
                 
-                // Typing detection
+                // Improved typing detection
                 const typingInput = document.querySelector("#id_message_send_input");
-                let isTyping = false;
                 
                 typingInput.addEventListener('input', () => {
-                    if (!isTyping) {
-                        this.send({ type: 'typing', username: "{{request.user.username}}" });
-                        isTyping = true;
-                    }
+                    const now = Date.now();
                     
+                    // Only send typing notification after 500ms of continuous typing
+                    clearTimeout(this.typingDebounceTimer);
+                    this.typingDebounceTimer = setTimeout(() => {
+                        if (!this.isTyping) {
+                            this.isTyping = true;
+                            this.send({ type: 'typing', username: "{{request.user.username}}" });
+                        }
+                        this.lastTypingTime = now;
+                    }, this.TYPING_DEBOUNCE);
+                    
+                    // Check for typing stop
                     clearTimeout(this.typingTimeout);
                     this.typingTimeout = setTimeout(() => {
-                        this.send({ type: 'stop_typing', username: "{{request.user.username}}" });
-                        isTyping = false;
-                    }, 2000);
+                        if (this.isTyping && (now - this.lastTypingTime > this.TYPING_INTERVAL)) {
+                            this.sendStopTyping();
+                        }
+                    }, this.TYPING_INTERVAL);
+                });
+                
+                // Handle input blur (when user clicks away)
+                typingInput.addEventListener('blur', () => {
+                    this.sendStopTyping();
                 });
                 
                 // Cleanup on page unload
