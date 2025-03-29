@@ -107,22 +107,21 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Channels configuration
-if DEBUG:
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels.layers.InMemoryChannelLayer"
-        }
+# channels.py or settings.py
+import os
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer"
     }
-else:
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {
-                "hosts": [os.environ.get('REDIS_URL')],
-            },
-        }
+} if os.getenv("DEBUG", "True") == "True" else {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [os.environ['REDIS_URL']],  # Will raise KeyError if missing
+        },
     }
+}
 
 # Authentication URLs
 LOGIN_REDIRECT_URL = "chat-page"
