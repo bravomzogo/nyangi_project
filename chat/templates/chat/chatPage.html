@@ -333,6 +333,9 @@
         receiveSound.volume = 0.3;
         
         let audioEnabled = false;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        const reconnectDelay = 3000; // 3 seconds
         
         function enableAudio() {
             if (audioEnabled) return;
@@ -352,14 +355,21 @@
         document.addEventListener('click', enableAudio, { once: true });
         document.addEventListener('keydown', enableAudio, { once: true });
         
-        const chatSocket = new WebSocket("ws://" + window.location.host + "/ws/chat/");
+        // Secure WebSocket connection (wss://)
+        const chatSocket = new WebSocket(
+            "wss://" + window.location.host + "/ws/chat/"
+        );
+        
         const connectionStatus = document.getElementById("connectionStatus");
         let typingTimeout;
         let currentTypingUsers = new Set();
+        let socketReconnectTimer;
 
         chatSocket.onopen = function (e) {
-            console.log("Connection established successfully!");
+            console.log("Secure WebSocket connection established successfully!");
             connectionStatus.innerHTML = '<i class="fas fa-circle online"></i> <span>Connected</span>';
+            reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+            
             setTimeout(() => {
                 connectionStatus.style.opacity = '0';
                 setTimeout(() => connectionStatus.style.display = 'none', 300);
@@ -370,7 +380,20 @@
             console.log("Connection closed unexpectedly");
             connectionStatus.style.display = 'flex';
             connectionStatus.style.opacity = '1';
-            connectionStatus.innerHTML = '<i class="fas fa-circle offline"></i> <span>Disconnected - Try refreshing</span>';
+            connectionStatus.innerHTML = '<i class="fas fa-circle offline"></i> <span>Disconnected - Reconnecting...</span>';
+            
+            // Attempt to reconnect
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                const delay = Math.min(reconnectDelay * reconnectAttempts, 30000); // Max 30s delay
+                console.log(`Attempting to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
+                
+                socketReconnectTimer = setTimeout(() => {
+                    window.location.reload(); // Simplest way to re-establish connection
+                }, delay);
+            } else {
+                connectionStatus.innerHTML = '<i class="fas fa-circle offline"></i> <span>Disconnected - Try refreshing</span>';
+            }
         };
         
         chatSocket.onerror = function (e) {
@@ -391,24 +414,26 @@
         document.querySelector("#id_message_send_button").addEventListener('click', sendMessage);
         
         document.querySelector("#id_message_send_input").addEventListener('input', function() {
-            chatSocket.send(JSON.stringify({
-                type: 'typing',
-                username: "{{request.user.username}}"
-            }));
-            clearTimeout(typingTimeout);
-            typingTimeout = setTimeout(() => {
+            if (chatSocket.readyState === WebSocket.OPEN) {
                 chatSocket.send(JSON.stringify({
-                    type: 'stop_typing',
+                    type: 'typing',
                     username: "{{request.user.username}}"
                 }));
-            }, 2000);
+                clearTimeout(typingTimeout);
+                typingTimeout = setTimeout(() => {
+                    chatSocket.send(JSON.stringify({
+                        type: 'stop_typing',
+                        username: "{{request.user.username}}"
+                    }));
+                }, 2000);
+            }
         });
         
         function sendMessage() {
             const messageInput = document.querySelector("#id_message_send_input");
             const message = messageInput.value.trim();
             
-            if (message) {
+            if (message && chatSocket.readyState === WebSocket.OPEN) {
                 chatSocket.send(JSON.stringify({
                     type: 'message',
                     message: message,
@@ -435,7 +460,8 @@
                 indicator.id = 'typing-indicator';
                 indicator.className = 'typing-indicator';
                 
-                const usersText = Array.from(currentTypingUsers).join(', ') + ' is typing';
+                const usersText = Array.from(currentTypingUsers).join(', ') + 
+                    (currentTypingUsers.size > 1 ? ' are typing' : ' is typing');
                 indicator.innerHTML = `
                     <span class="username">${usersText}</span>
                     <span class="dot"></span>
@@ -512,11 +538,25 @@
                 } else if (data.type === 'stop_typing') {
                     currentTypingUsers.delete(data.username);
                     updateTypingIndicator();
+                } else if (data.type === 'user_joined') {
+                    // Handle user join notifications if needed
+                } else if (data.type === 'user_left') {
+                    // Handle user leave notifications if needed
                 }
             } catch (error) {
                 console.error("Error processing message:", error);
             }
         };
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', function() {
+            if (chatSocket.readyState === WebSocket.OPEN) {
+                chatSocket.close();
+            }
+            if (socketReconnectTimer) {
+                clearTimeout(socketReconnectTimer);
+            }
+        });
     </script>
 </body>
 </html>
