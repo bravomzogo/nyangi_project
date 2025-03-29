@@ -326,236 +326,307 @@
     </div>
 
     <script>
+        // Audio setup
         const sendSound = new Audio("{% static 'sounds/send_sound.wav' %}");
         const receiveSound = new Audio("{% static 'sounds/receive_sound.mp3' %}");
-        
         sendSound.volume = 0.3;
         receiveSound.volume = 0.3;
-        
         let audioEnabled = false;
-        let reconnectAttempts = 0;
-        const maxReconnectAttempts = 5;
-        const reconnectDelay = 3000; // 3 seconds
-        
-        function enableAudio() {
-            if (audioEnabled) return;
-            
-            const silentSound = new Audio();
-            silentSound.volume = 0;
-            silentSound.play()
-                .then(() => {
-                    audioEnabled = true;
-                    console.log("Audio enabled");
-                })
-                .catch(e => {
-                    console.log("Audio permission not granted yet");
-                });
-        }
-        
-        document.addEventListener('click', enableAudio, { once: true });
-        document.addEventListener('keydown', enableAudio, { once: true });
-        
-        // Secure WebSocket connection (wss://)
-        const chatSocket = new WebSocket(
-            "wss://" + window.location.host + "/ws/chat/"
-        );
-        
-        const connectionStatus = document.getElementById("connectionStatus");
-        let typingTimeout;
-        let currentTypingUsers = new Set();
-        let socketReconnectTimer;
 
-        chatSocket.onopen = function (e) {
-            console.log("Secure WebSocket connection established successfully!");
-            connectionStatus.innerHTML = '<i class="fas fa-circle online"></i> <span>Connected</span>';
-            reconnectAttempts = 0; // Reset reconnect attempts on successful connection
-            
-            setTimeout(() => {
-                connectionStatus.style.opacity = '0';
-                setTimeout(() => connectionStatus.style.display = 'none', 300);
-            }, 2000);
-        };
-        
-        chatSocket.onclose = function (e) {
-            console.log("Connection closed unexpectedly");
-            connectionStatus.style.display = 'flex';
-            connectionStatus.style.opacity = '1';
-            connectionStatus.innerHTML = '<i class="fas fa-circle offline"></i> <span>Disconnected - Reconnecting...</span>';
-            
-            // Attempt to reconnect
-            if (reconnectAttempts < maxReconnectAttempts) {
-                reconnectAttempts++;
-                const delay = Math.min(reconnectDelay * reconnectAttempts, 30000); // Max 30s delay
-                console.log(`Attempting to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
+        // WebSocket Connection Manager
+        class ChatConnection {
+            constructor() {
+                this.socket = null;
+                this.reconnectAttempts = 0;
+                this.maxReconnectAttempts = 5;
+                this.baseReconnectDelay = 3000;
+                this.typingTimeout = null;
+                this.currentTypingUsers = new Set();
+                this.heartbeatInterval = null;
+                this.init();
+            }
+
+            init() {
+                this.connect();
+                this.setupEventListeners();
+                this.enableAudio();
+            }
+
+            connect() {
+                // Close existing connection if any
+                if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
+                    this.socket.close();
+                }
+
+                this.socket = new WebSocket(
+                    "wss://" + window.location.host + "/ws/chat/",
+                    ['chat-v1']  // Protocol version
+                );
+
+                this.socket.onopen = () => this.handleOpen();
+                this.socket.onclose = (e) => this.handleClose(e);
+                this.socket.onerror = (e) => this.handleError(e);
+                this.socket.onmessage = (e) => this.handleMessage(e);
+            }
+
+            handleOpen() {
+                console.log("WebSocket connected");
+                this.reconnectAttempts = 0;
+                this.updateConnectionStatus('online', 'Connected');
+
+                // Start heartbeat
+                this.heartbeatInterval = setInterval(() => {
+                    if (this.socket.readyState === WebSocket.OPEN) {
+                        this.send({ type: 'ping' });
+                    }
+                }, 25000);  // 25 seconds
+
+                // Notify server of connection
+                this.send({ 
+                    type: 'presence', 
+                    user: "{{request.user.username}}",
+                    status: 'online'
+                });
+            }
+
+            handleClose(event) {
+                console.log(`WebSocket closed: ${event.code}`);
+                clearInterval(this.heartbeatInterval);
                 
-                socketReconnectTimer = setTimeout(() => {
-                    window.location.reload(); // Simplest way to re-establish connection
-                }, delay);
-            } else {
-                connectionStatus.innerHTML = '<i class="fas fa-circle offline"></i> <span>Disconnected - Try refreshing</span>';
+                if (event.code === 1006 && this.reconnectAttempts < this.maxReconnectAttempts) {
+                    const delay = Math.min(
+                        this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
+                        30000  // Max 30s delay
+                    );
+                    
+                    this.updateConnectionStatus(
+                        'offline', 
+                        `Reconnecting in ${Math.round(delay/1000)}s...`
+                    );
+                    
+                    setTimeout(() => this.connect(), delay);
+                    this.reconnectAttempts++;
+                } else {
+                    this.updateConnectionStatus(
+                        'offline', 
+                        'Disconnected - Please refresh'
+                    );
+                }
             }
-        };
-        
-        chatSocket.onerror = function (e) {
-            console.error("WebSocket error:", e);
-            connectionStatus.style.display = 'flex';
-            connectionStatus.style.opacity = '1';
-            connectionStatus.innerHTML = '<i class="fas fa-circle offline"></i> <span>Connection error</span>';
-        };
-        
-        document.querySelector("#id_message_send_input").focus();
-        
-        document.querySelector("#id_message_send_input").addEventListener('keyup', function (e) {
-            if (e.key === "Enter") {
-                sendMessage();
+
+            handleError(error) {
+                console.error("WebSocket error:", error);
+                this.updateConnectionStatus('offline', 'Connection error');
             }
-        });
-        
-        document.querySelector("#id_message_send_button").addEventListener('click', sendMessage);
-        
-        document.querySelector("#id_message_send_input").addEventListener('input', function() {
-            if (chatSocket.readyState === WebSocket.OPEN) {
-                chatSocket.send(JSON.stringify({
-                    type: 'typing',
-                    username: "{{request.user.username}}"
-                }));
-                clearTimeout(typingTimeout);
-                typingTimeout = setTimeout(() => {
-                    chatSocket.send(JSON.stringify({
-                        type: 'stop_typing',
-                        username: "{{request.user.username}}"
-                    }));
-                }, 2000);
+
+            handleMessage(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch(data.type) {
+                        case 'message':
+                            this.displayMessage(data);
+                            break;
+                        case 'typing':
+                            this.handleTyping(data.username, true);
+                            break;
+                        case 'stop_typing':
+                            this.handleTyping(data.username, false);
+                            break;
+                        case 'presence':
+                            // Handle user join/leave notifications
+                            break;
+                        case 'pong':
+                            // Heartbeat response
+                            break;
+                        default:
+                            console.warn("Unknown message type:", data.type);
+                    }
+                } catch (error) {
+                    console.error("Error processing message:", error);
+                }
             }
-        });
-        
-        function sendMessage() {
-            const messageInput = document.querySelector("#id_message_send_input");
-            const message = messageInput.value.trim();
-            
-            if (message && chatSocket.readyState === WebSocket.OPEN) {
-                chatSocket.send(JSON.stringify({
-                    type: 'message',
-                    message: message,
-                    username: "{{request.user.username}}"
-                }));
+
+            displayMessage(data) {
+                const timeString = this.formatTimestamp(data.timestamp);
+                const isCurrentUser = data.username === "{{request.user.username}}";
                 
-                if (audioEnabled) {
-                    sendSound.currentTime = 0;
-                    sendSound.play().catch(e => console.log("Send sound error:", e));
+                // Play receive sound for others' messages
+                if (!isCurrentUser && audioEnabled) {
+                    receiveSound.currentTime = 0;
+                    receiveSound.play().catch(e => console.log("Receive sound error:", e));
                 }
                 
-                messageInput.value = "";
-            }
-        }
-        
-        function updateTypingIndicator() {
-            const existingIndicator = document.getElementById('typing-indicator');
-            if (existingIndicator) {
-                existingIndicator.remove();
-            }
-            
-            if (currentTypingUsers.size > 0) {
-                const indicator = document.createElement('div');
-                indicator.id = 'typing-indicator';
-                indicator.className = 'typing-indicator';
+                const messageDiv = document.createElement("div");
+                messageDiv.classList.add("message", isCurrentUser ? "user-message" : "other-message");
                 
-                const usersText = Array.from(currentTypingUsers).join(', ') + 
-                    (currentTypingUsers.size > 1 ? ' are typing' : ' is typing');
-                indicator.innerHTML = `
-                    <span class="username">${usersText}</span>
-                    <span class="dot"></span>
-                    <span class="dot"></span>
-                    <span class="dot"></span>
+                messageDiv.innerHTML = isCurrentUser ? `
+                    <div class="message-content">${data.message}</div>
+                    <div class="message-time">
+                        ${timeString}
+                        <i class="fas fa-check-double read-receipt"></i>
+                    </div>
+                ` : `
+                    <div class="message-username">${data.username}</div>
+                    <div class="message-content">${data.message}</div>
+                    <div class="message-time">${timeString}</div>
                 `;
                 
-                document.getElementById("id_chat_item_container").appendChild(indicator);
-                scrollToBottom();
+                document.getElementById("id_chat_item_container").appendChild(messageDiv);
+                this.scrollToBottom();
             }
-        }
-        
-        function scrollToBottom() {
-            const container = document.getElementById("id_chat_item_container");
-            container.scrollTop = container.scrollHeight;
-        }
-        
-        function formatTimestamp(timestamp) {
-            if (!timestamp) return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            
-            try {
-                const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
-                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            } catch (e) {
-                console.error("Error formatting timestamp:", e);
-                return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            }
-        }
-        
-        chatSocket.onmessage = function (e) {
-            try {
-                const data = JSON.parse(e.data);
-                
-                if (data.type === 'message') {
-                    const timeString = formatTimestamp(data.timestamp);
-                    
-                    if (data.username !== "{{request.user.username}}" && audioEnabled) {
-                        receiveSound.currentTime = 0;
-                        receiveSound.play().catch(e => console.log("Receive sound error:", e));
-                    }
-                    
-                    const messageDiv = document.createElement("div");
-                    messageDiv.classList.add("message");
-                    
-                    if (data.username === "{{request.user.username}}") {
-                        messageDiv.classList.add("user-message");
-                        messageDiv.innerHTML = `
-                            <div class="message-content">${data.message}</div>
-                            <div class="message-time">
-                                ${timeString}
-                                <i class="fas fa-check-double read-receipt"></i>
-                            </div>
-                        `;
-                    } else {
-                        messageDiv.classList.add("other-message");
-                        messageDiv.innerHTML = `
-                            <div class="message-username">${data.username}</div>
-                            <div class="message-content">${data.message}</div>
-                            <div class="message-time">${timeString}</div>
-                        `;
-                    }
-                    
-                    document.getElementById("id_chat_item_container").appendChild(messageDiv);
-                    scrollToBottom();
-                } else if (data.type === 'typing') {
-                    if (data.username !== "{{request.user.username}}") {
-                        currentTypingUsers.add(data.username);
-                        updateTypingIndicator();
-                        setTimeout(() => {
-                            currentTypingUsers.delete(data.username);
-                            updateTypingIndicator();
-                        }, 2500);
-                    }
-                } else if (data.type === 'stop_typing') {
-                    currentTypingUsers.delete(data.username);
-                    updateTypingIndicator();
-                } else if (data.type === 'user_joined') {
-                    // Handle user join notifications if needed
-                } else if (data.type === 'user_left') {
-                    // Handle user leave notifications if needed
-                }
-            } catch (error) {
-                console.error("Error processing message:", error);
-            }
-        };
 
-        // Clean up on page unload
-        window.addEventListener('beforeunload', function() {
-            if (chatSocket.readyState === WebSocket.OPEN) {
-                chatSocket.close();
+            handleTyping(username, isTyping) {
+                if (username === "{{request.user.username}}") return;
+                
+                if (isTyping) {
+                    this.currentTypingUsers.add(username);
+                } else {
+                    this.currentTypingUsers.delete(username);
+                }
+                this.updateTypingIndicator();
             }
-            if (socketReconnectTimer) {
-                clearTimeout(socketReconnectTimer);
+
+            updateTypingIndicator() {
+                const existingIndicator = document.getElementById('typing-indicator');
+                if (existingIndicator) existingIndicator.remove();
+                
+                if (this.currentTypingUsers.size > 0) {
+                    const indicator = document.createElement('div');
+                    indicator.id = 'typing-indicator';
+                    indicator.className = 'typing-indicator';
+                    
+                    const usersText = Array.from(this.currentTypingUsers).join(', ') + 
+                        (this.currentTypingUsers.size > 1 ? ' are typing' : ' is typing');
+                    indicator.innerHTML = `
+                        <span class="username">${usersText}</span>
+                        <span class="dot"></span>
+                        <span class="dot"></span>
+                        <span class="dot"></span>
+                    `;
+                    
+                    document.getElementById("id_chat_item_container").appendChild(indicator);
+                    this.scrollToBottom();
+                }
             }
+
+            send(data) {
+                if (this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify(data));
+                } else {
+                    console.warn("Cannot send - WebSocket not open");
+                    // Optionally queue messages for when connection resumes
+                }
+            }
+
+            sendMessage() {
+                const input = document.querySelector("#id_message_send_input");
+                const message = input.value.trim();
+                
+                if (message) {
+                    this.send({
+                        type: 'message',
+                        message: message,
+                        username: "{{request.user.username}}"
+                    });
+                    
+                    if (audioEnabled) {
+                        sendSound.currentTime = 0;
+                        sendSound.play().catch(e => console.log("Send sound error:", e));
+                    }
+                    
+                    input.value = "";
+                    input.focus();
+                }
+            }
+
+            updateConnectionStatus(status, message) {
+                const element = document.getElementById("connectionStatus");
+                element.style.display = 'flex';
+                element.style.opacity = '1';
+                element.innerHTML = `
+                    <i class="fas fa-circle ${status}"></i>
+                    <span>${message}</span>
+                `;
+                
+                if (status === 'online') {
+                    setTimeout(() => {
+                        element.style.opacity = '0';
+                        setTimeout(() => element.style.display = 'none', 300);
+                    }, 2000);
+                }
+            }
+
+            scrollToBottom() {
+                const container = document.getElementById("id_chat_item_container");
+                container.scrollTop = container.scrollHeight;
+            }
+
+            formatTimestamp(timestamp) {
+                if (!timestamp) return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                try {
+                    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+                    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                } catch (e) {
+                    console.error("Error formatting timestamp:", e);
+                    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+            }
+
+            enableAudio() {
+                const enable = () => {
+                    if (audioEnabled) return;
+                    const silentSound = new Audio();
+                    silentSound.volume = 0;
+                    silentSound.play()
+                        .then(() => audioEnabled = true)
+                        .catch(console.error);
+                };
+                
+                document.addEventListener('click', enable, { once: true });
+                document.addEventListener('keydown', enable, { once: true });
+            }
+
+            setupEventListeners() {
+                // Message input
+                document.querySelector("#id_message_send_input").addEventListener('keyup', (e) => {
+                    if (e.key === "Enter") this.sendMessage();
+                });
+                
+                // Send button
+                document.querySelector("#id_message_send_button").addEventListener('click', () => {
+                    this.sendMessage();
+                });
+                
+                // Typing detection
+                document.querySelector("#id_message_send_input").addEventListener('input', () => {
+                    this.send({ type: 'typing', username: "{{request.user.username}}" });
+                    clearTimeout(this.typingTimeout);
+                    this.typingTimeout = setTimeout(() => {
+                        this.send({ type: 'stop_typing', username: "{{request.user.username}}" });
+                    }, 2000);
+                });
+                
+                // Cleanup on page unload
+                window.addEventListener('beforeunload', () => {
+                    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                        this.send({ 
+                            type: 'presence',
+                            user: "{{request.user.username}}",
+                            status: 'offline'
+                        });
+                        this.socket.close();
+                    }
+                    clearInterval(this.heartbeatInterval);
+                });
+            }
+        }
+
+        // Initialize when DOM is ready
+        document.addEventListener('DOMContentLoaded', () => {
+            const chat = new ChatConnection();
+            document.querySelector("#id_message_send_input").focus();
         });
     </script>
 </body>
