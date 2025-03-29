@@ -131,6 +131,4 @@ LOGOUT_REDIRECT_URL = "login-user"
 # Security headers (production only)
 # Ensure these security settings are enabled
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-SECURE_SSL_REDIRECT = True
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SECURE = True
+SECURE_SSL_REDIRECT = True  # Redirect HTTP → HTTPS
