@@ -258,6 +258,10 @@
             color: #F4212E;
         }
         
+        .reconnecting {
+            color: #FFAD1F;
+        }
+        
         ::-webkit-scrollbar {
             width: 8px;
         }
@@ -338,11 +342,13 @@
             constructor() {
                 this.socket = null;
                 this.reconnectAttempts = 0;
-                this.maxReconnectAttempts = 5;
-                this.baseReconnectDelay = 3000;
+                this.maxReconnectAttempts = 10;  // Increased max attempts
+                this.baseReconnectDelay = 1000;  // Start with 1s delay
+                this.maxReconnectDelay = 30000;  // Max 30s delay
                 this.typingTimeout = null;
                 this.currentTypingUsers = new Set();
                 this.heartbeatInterval = null;
+                this.messageQueue = [];  // Queue for messages when offline
                 this.init();
             }
 
@@ -358,10 +364,12 @@
                     this.socket.close();
                 }
 
-                this.socket = new WebSocket(
-                    "wss://" + window.location.host + "/ws/chat/",
-                    ['chat-v1']  // Protocol version
-                );
+                // Determine WebSocket protocol based on current page
+                const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+                const wsUrl = protocol + window.location.host + "/ws/chat/";
+                
+                console.log("Connecting to WebSocket:", wsUrl);
+                this.socket = new WebSocket(wsUrl, ['chat-v1']);
 
                 this.socket.onopen = () => this.handleOpen();
                 this.socket.onclose = (e) => this.handleClose(e);
@@ -379,7 +387,7 @@
                     if (this.socket.readyState === WebSocket.OPEN) {
                         this.send({ type: 'ping' });
                     }
-                }, 25000);  // 25 seconds
+                }, 20000);  // 20 seconds
 
                 // Notify server of connection
                 this.send({ 
@@ -387,21 +395,22 @@
                     user: "{{request.user.username}}",
                     status: 'online'
                 });
+
+                // Send any queued messages
+                this.flushMessageQueue();
             }
 
             handleClose(event) {
-                console.log(`WebSocket closed: ${event.code}`);
+                console.log(`WebSocket closed: ${event.code}`, event);
                 clearInterval(this.heartbeatInterval);
                 
-                if (event.code === 1006 && this.reconnectAttempts < this.maxReconnectAttempts) {
-                    const delay = Math.min(
-                        this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
-                        30000  // Max 30s delay
-                    );
+                // Abnormal closure (1006) or network error
+                if (event.code === 1006 || event.code === 1001 || event.code === 1002) {
+                    const delay = this.calculateReconnectDelay();
                     
                     this.updateConnectionStatus(
-                        'offline', 
-                        `Reconnecting in ${Math.round(delay/1000)}s...`
+                        'reconnecting', 
+                        `Connection lost - Reconnecting in ${Math.round(delay/1000)}s...`
                     );
                     
                     setTimeout(() => this.connect(), delay);
@@ -412,6 +421,15 @@
                         'Disconnected - Please refresh'
                     );
                 }
+            }
+
+            calculateReconnectDelay() {
+                // Exponential backoff with jitter
+                const baseDelay = Math.min(
+                    this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
+                    this.maxReconnectDelay
+                );
+                return baseDelay * (0.5 + Math.random());  // Add jitter
             }
 
             handleError(error) {
@@ -434,16 +452,19 @@
                             this.handleTyping(data.username, false);
                             break;
                         case 'presence':
-                            // Handle user join/leave notifications
+                            this.handlePresenceUpdate(data);
                             break;
                         case 'pong':
-                            // Heartbeat response
+                            // Heartbeat response - connection is healthy
+                            break;
+                        case 'error':
+                            console.error("Server error:", data.message);
                             break;
                         default:
                             console.warn("Unknown message type:", data.type);
                     }
                 } catch (error) {
-                    console.error("Error processing message:", error);
+                    console.error("Error processing message:", error, event.data);
                 }
             }
 
@@ -461,14 +482,14 @@
                 messageDiv.classList.add("message", isCurrentUser ? "user-message" : "other-message");
                 
                 messageDiv.innerHTML = isCurrentUser ? `
-                    <div class="message-content">${data.message}</div>
+                    <div class="message-content">${this.escapeHtml(data.message)}</div>
                     <div class="message-time">
                         ${timeString}
                         <i class="fas fa-check-double read-receipt"></i>
                     </div>
                 ` : `
-                    <div class="message-username">${data.username}</div>
-                    <div class="message-content">${data.message}</div>
+                    <div class="message-username">${this.escapeHtml(data.username)}</div>
+                    <div class="message-content">${this.escapeHtml(data.message)}</div>
                     <div class="message-time">${timeString}</div>
                 `;
                 
@@ -485,6 +506,15 @@
                     this.currentTypingUsers.delete(username);
                 }
                 this.updateTypingIndicator();
+            }
+
+            handlePresenceUpdate(data) {
+                // Optional: Show user join/leave notifications
+                if (data.status === 'online') {
+                    console.log(`${data.user} joined the chat`);
+                } else if (data.status === 'offline') {
+                    console.log(`${data.user} left the chat`);
+                }
             }
 
             updateTypingIndicator() {
@@ -512,10 +542,37 @@
 
             send(data) {
                 if (this.socket.readyState === WebSocket.OPEN) {
-                    this.socket.send(JSON.stringify(data));
+                    try {
+                        this.socket.send(JSON.stringify(data));
+                    } catch (error) {
+                        console.error("Error sending message:", error);
+                        this.queueMessage(data);
+                    }
                 } else {
                     console.warn("Cannot send - WebSocket not open");
-                    // Optionally queue messages for when connection resumes
+                    this.queueMessage(data);
+                    this.attemptReconnect();
+                }
+            }
+
+            queueMessage(data) {
+                if (data.type !== 'ping' && data.type !== 'pong') {
+                    this.messageQueue.push(data);
+                }
+            }
+
+            flushMessageQueue() {
+                while (this.messageQueue.length > 0 && this.socket.readyState === WebSocket.OPEN) {
+                    const message = this.messageQueue.shift();
+                    this.socket.send(JSON.stringify(message));
+                }
+            }
+
+            attemptReconnect() {
+                if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                    const delay = this.calculateReconnectDelay();
+                    setTimeout(() => this.connect(), delay);
+                    this.reconnectAttempts++;
                 }
             }
 
@@ -527,7 +584,8 @@
                     this.send({
                         type: 'message',
                         message: message,
-                        username: "{{request.user.username}}"
+                        username: "{{request.user.username}}",
+                        timestamp: new Date().toISOString()
                     });
                     
                     if (audioEnabled) {
@@ -574,14 +632,27 @@
                 }
             }
 
+            escapeHtml(unsafe) {
+                if (!unsafe) return '';
+                return unsafe
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#039;");
+            }
+
             enableAudio() {
                 const enable = () => {
                     if (audioEnabled) return;
                     const silentSound = new Audio();
                     silentSound.volume = 0;
                     silentSound.play()
-                        .then(() => audioEnabled = true)
-                        .catch(console.error);
+                        .then(() => {
+                            audioEnabled = true;
+                            console.log("Audio enabled");
+                        })
+                        .catch(e => console.error("Audio enable failed:", e));
                 };
                 
                 document.addEventListener('click', enable, { once: true });
@@ -600,11 +671,19 @@
                 });
                 
                 // Typing detection
-                document.querySelector("#id_message_send_input").addEventListener('input', () => {
-                    this.send({ type: 'typing', username: "{{request.user.username}}" });
+                const typingInput = document.querySelector("#id_message_send_input");
+                let isTyping = false;
+                
+                typingInput.addEventListener('input', () => {
+                    if (!isTyping) {
+                        this.send({ type: 'typing', username: "{{request.user.username}}" });
+                        isTyping = true;
+                    }
+                    
                     clearTimeout(this.typingTimeout);
                     this.typingTimeout = setTimeout(() => {
                         this.send({ type: 'stop_typing', username: "{{request.user.username}}" });
+                        isTyping = false;
                     }, 2000);
                 });
                 
@@ -620,6 +699,14 @@
                     }
                     clearInterval(this.heartbeatInterval);
                 });
+                
+                // Visibility change handling
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState === 'visible' && 
+                        (!this.socket || this.socket.readyState !== WebSocket.OPEN)) {
+                        this.connect();
+                    }
+                });
             }
         }
 
@@ -627,6 +714,12 @@
         document.addEventListener('DOMContentLoaded', () => {
             const chat = new ChatConnection();
             document.querySelector("#id_message_send_input").focus();
+            
+            // Manual reconnect button for debugging
+            window.debugReconnect = function() {
+                console.log("Manual reconnect triggered");
+                chat.connect();
+            };
         });
     </script>
 </body>
